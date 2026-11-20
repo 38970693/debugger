@@ -1,0 +1,46 @@
+{
+  "name": "cocos-browser-bridge",
+  "version": "0.1.0",
+  "package_version": 2,
+  "title": "Chrome 浏览器连接",
+  "description": "通过 CDP Bridge 连接现有 Chrome 页签，并提供本地 MCP 服务。",
+  "author": "Cocos Browser Bridge",
+  "editor": ">=3.8.6 <3.9.0",
+  "private": true,
+  "main": "./dist/main.js",
+  "panels": {
+    "default": {
+      "title": "Chrome 浏览器连接",
+      "type": "dockable",
+      "main": "./panels/browser/index.js",
+      "size": { "width": 630, "height": 570, "min-width": 375, "min-height": 350 }
+    }
+  },
+  "contributions": {
+    "menu": [
+      { "path": "Chrome", "label": "浏览器连接", "message": "open-panel" }
+    ],
+    "messages": {
+      "open-panel": { "methods": ["openPanel"] },
+      "service-info": { "methods": ["serviceInfo"] },
+      "mcp-credentials": { "methods": ["mcpCredentials"] },
+      "bridge-status": { "methods": ["bridgeStatus"] },
+      "list-browser-targets": { "methods": ["listBrowserTargets"] },
+      "connect-browser": { "methods": ["connectBrowser"] },
+      "browser-page-status": { "methods": ["browserPageStatus"] }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "test": "node --test tests/*.test.cjs",
+    "release": "npm run build && node scripts/release.cjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ws": "8.23.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

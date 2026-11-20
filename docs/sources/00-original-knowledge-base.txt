@@ -1,0 +1,755 @@
+
+
+我的资料
+
+mcp
+Cocos MCP 浏览器连接与信息获取·知
+识库.md
+
+
+
+
+
+
+Cocos MCP 浏览器连接与信息获取·知识库
+Cocos MCP 浏览器连接与信息获取 · 知识库
+面向读者：需要理解或扩展 Cocos MCP「浏览器调试」能力的开发者。
+路径基准：本文所有相对路径均以项目根目录 cocos_mcp/ 为基准；行号基于写入时的源码，重构后请以符号名为准。
+覆盖范围：src/**、browser-companion/**、docs/** 中与「连接浏览器」和「从浏览器获取信息」相关的全部实现。
+0. 先建立心智模型：这套系统到底在干什么
+一句话概括：MCP 通过三条可选的「管道」接进浏览器页面，然后用一套统一的工具对页面做「读状态 / 收事件 / 发输入 / 录性能」，最后把证据有界、脱敏地回传给 AI。
+打个比方：
+你（AI）坐在控制台前，想观察并操纵远处房间（浏览器页面）里的一台机器（Cocos 游戏）。
+you 不能直接伸手进去，得选一根「线」接过去。这里有三根线，接口一样，插哪根都能用同一套遥控器：
+Creator GameView 线：机器就在隔壁房间（Creator 编辑器内部的 GameView），走的是 Electron 的内部通道，插上就能用，零配置。
+Chrome CDP 线：机器在一台独立的 Chrome 里，走的是 Chrome 标准调试协议（CDP）。要么自己新开一个带调试端口的 Chrome，要么用 CDP Bridge 扩展接管一个已经打开的普通 Chrome。
+Companion 线：老版本的专用扩展通道，保留给还没迁移的用户。
+三根线在代码里叫 transport，取值分别是 creator-gameview / chrome-cdp / chrome-companion。上层工具不关心你插的是哪根，因为有一个「路由器」把统一的调用转发给当前生效的那根线。
+理解这一点后，剩下的细节都是围绕两个问题展开：
+怎么接线（连接 / 接管 / 切换 / 断线恢复）—— 对应第 3、4 部分。
+接上以后能拿到什么（页面状态、DOM、console、异常、网络、截图、WebGL、性能 trace）—— 对应第 8 部分。
+1. 全景架构
+1.1 分层图
+┌─────────────────────────────────────────────────────────────────┐
+│  AI / MCP 客户端                                                 │
+│  (通过 Streamable HTTP 调 MCP 工具)                              │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │  tools/call
+┌───────────────────────────▼─────────────────────────────────────┐
+│  L1 接入层  src/access/mcp/                                       │
+│  runtime.ts        创建 McpServer、注册工具、格式化返回             │
+│  tool-schema.ts    Zod → JSON Schema（含 discriminated union）    │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │  registry.execute(name, input, ctx)
+┌───────────────────────────▼─────────────────────────────────────┐
+│  L2 应用层  src/application/modules/browser-*.ts  (6 个工具)       │
+│  browser_connect / page / interact / monitor / investigate / perf │
+│  browser-connection.ts  ← 连接决策大脑（选目标 / 重试 / 恢复）       │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │  Domain Port（接口，不依赖具体实现）
+┌───────────────────────────▼─────────────────────────────────────┐
+│  L3 领域层  src/domain/creator/                                    │
+│  browser-cdp-port.ts      统一页面端口：list/connect/读/写/交互     │
+│  browser-monitor-port.ts  统一事件端口：start/read/stop            │
+│  browser-trace-limits.ts  性能预算常量                            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │  依赖注入（container.ts 装配）
+┌───────────────────────────▼─────────────────────────────────────┐
+│  L4 基础设施层  src/infrastructure/creator/browser-*.ts           │
+│  ┌────────────┬────────────┬───────────────┐                     │
+│  │ Electron   │ Chrome CDP │ Companion     │  ← 三条通路的适配器    │
+│  │ GameView   │ 直连/隧道   │ 旧扩展 WS     │                     │
+│  └─────┬──────┴─────┬──────┴───────┬───────┘                     │
+│        │  Router（页面路由 + 监控路由）按 transport 切换 active     │
+└────────┼────────────┼──────────────┼────────────────────────────┘
+         │            │              │
+┌────────▼────────────▼──────────────▼────────────────────────────┐
+│  L5 浏览器侧                                                      │
+│  Creator GameView(webContents) │ Chrome(CDP 9220/9222/原生端口)    │
+│                                │ CDP Bridge 扩展 → relay 9221     │
+│                                │ 旧 Companion 扩展               │
+└─────────────────────────────────────────────────────────────────┘
+为什么要分这么多层？
+L3 的「端口（Port）」就是一份契约：上层只知道「我能调 click()、read()」，不知道底层是 Electron 的 sendInputEvent 还是 CDP 的 Input.dispatchMouseEvent。
+L4 的「路由器（Router）」持有三个实现，同一个时刻只让一个生效（active）。切换通路 = 换 active，上层代码一行不用改。
+这样加一条新通路时，只要实现同一个端口接口、在 container 里注册进去即可，不用动任何工具代码。
+1.2 目录地图
+目录 / 文件
+角色
+src/access/mcp/runtime.ts
+MCP 服务启动、工具注册、返回格式化
+src/access/mcp/tool-schema.ts
+Zod schema → MCP JSON Schema
+src/application/modules/browser-*.ts
+6 个浏览器工具的定义与执行
+src/application/browser-connection.ts
+连接决策（选目标、重试、接管、恢复）
+src/domain/creator/browser-cdp-port.ts
+统一页面端口 + 所有数据类型
+src/domain/creator/browser-monitor-port.ts
+统一事件端口 + 事件模型
+src/domain/creator/browser-trace-limits.ts
+trace 预算常量
+src/infrastructure/creator/browser-*.ts
+三条通路的具体实现、路由、脱敏、截图、trace
+src/bootstrap/container.ts
+依赖装配（把实现塞进端口）
+src/bootstrap/config.ts
+全局配置（host/port/authToken）
+browser-companion/
+Chrome 扩展 + 一键安装/打包/更新脚本
+docs/CHROME_MONITOR.md
+官方的浏览器调试使用说明（必读）
+2. L1 接入层：MCP 服务与工具注册
+2.1 src/access/mcp/runtime.ts（约 180 行）
+职责：把「能力注册表（registry）」里的工具，暴露成标准的 MCP 服务。
+createMcpRuntime(registry, options) 是入口，构造一个 McpServer（基于 @modelcontextprotocol/sdk）。
+McpRuntimeOptions：serverName、serverVersion、profile、readOnly、enabledGroups、createCallId?。
+构造 SessionAccessController 做 profile / 分组 / 只读权限控制。
+遍历 registry.tools()，对每个工具调用 server.registerTool(...)。回调里：
+生成 callId；
+registry.execute(tool.name, input, access.executionContext(callId))；
+用 toFailure 兜底异常；
+返回 { content, structuredContent, isError? }。
+资源注册：server.registerResource。
+动态可见性：updateVisibility 订阅访问快照，通过 syncRegistrations enable/disable 工具；并覆写 ListToolsRequestSchema，只返回当前已启用的工具。
+返回格式化：
+createToolContent：把 artifacts（如截图）转成 image content 一起返回；
+formatToolText：成功取 summary，失败取 code: message；
+createStructuredContent：剔除 artifacts 后的结构化数据。
+2.2 src/access/mcp/tool-schema.ts（26 行）
+toolInputJsonSchema(input: ZodType) 用 z.toJSONSchema(...draft-7...) 生成 schema。
+关键点：对 discriminatedUnion 做了特殊处理——合并各分支的 properties、取公共 required。因为 SDK 对 union 会回退成空对象，这里保留分支约束和边界，让 AI 能正确看到每个 action 的字段。
+3. 三条通路详解
+领域枚举定义在 src/domain/creator/browser-cdp-port.ts:33：
+transport: "creator-gameview" | "chrome-cdp" | "chrome-companion"
+通路
+transport
+底层机制
+适用场景
+核心适配器
+Creator GameView（默认）
+creator-gameview
+Electron webContents.debugger / executeJavaScript / sendInputEvent
+零配置，Creator 内 GameView Preview
+browser-page-electron.ts、browser-monitor-electron.ts
+Chrome CDP（推荐）
+chrome-cdp
+chrome-remote-interface 连本地 CDP 端口（9220 / 9222 / 原生 DevToolsActivePort）
+专用 Chrome、CDP Bridge 接管已打开网页、DevTools 共存
+browser-monitor-cdp.ts（同时实现 BrowserCdpPort）
+Companion（旧兼容）
+chrome-companion
+Chrome 扩展 WS → MCP 内置 WS 服务器 /browser-companion，扩展内用 chrome.debugger
+旧版 Companion 扩展兼容
+browser-companion-server.ts、browser-page-companion.ts、browser-monitor-companion.ts
+两个路由器负责在三条通路间切换：
+browser-cdp-router.ts 的 BrowserCdpRouter（页面 / 操作路由）：active 指向三者之一，:31-44。
+browser-monitor-router.ts 的 BrowserMonitorRouter（监控路由）：同样三选一，:5-23。
+装配入口：src/bootstrap/container.ts:163-185。两者必须保持同步——useChrome() 时页面路由和监控路由一起切到 Chrome CDP（container 里的回调 :352-357, 377-382 联动）。
+4. 六个浏览器工具逐个详解
+所有浏览器工具都归在 group: "runtime"，version: "1.0.0"，apiVersion: 1，minCreatorVersion: "3.8.6"。
+通过 CapabilityModule.register(registration).tool(...) 注册。
+4.1 browser_connect — 连接/接管/断开
+文件：src/application/modules/browser-connect.ts
+id runtime.browser-connect；profiles ["runtime","core"]；risk process；annotations：readOnlyHint:false, destructiveHint:false, idempotentHint:true, openWorldHint:true。
+输入是 discriminatedUnion("action")，七个 action：
+action
+字段（默认 / 约束）
+含义
+list
+port int 1..65535，默认 9220
+扫描指定端口上的可接管页面
+connect
+port 默认 9220；targetId 必填(1..500)；url 可选(web URL≤2000)；title 可选(≤500)
+按 targetId 连接
+launch
+url 可选(≤2000)
+新开一个带调试端口的 Chrome
+current
+url 可选(web URL≤2000)
+原生接管当前已打开的 Chrome（DevTools 共存）
+adopt
+port 默认 9220；url 可选(web URL≤2000)
+通过 CDP Bridge 接管已打开网页
+status
+无
+查询当前连接状态
+disconnect
+无
+断开并回到 GameView
+执行：list → cdp.list(port) 返回 ChromeCdpTarget[]；其余走 connectBrowserPage(...) 返回 ChromeCdpStatus。
+4.2 browser_page — 只读页面探查
+文件：src/application/modules/browser-page.ts
+id runtime.browser-page；profiles ["runtime","core","readOnly"]；risk read；只读工具。
+输入 action：
+action
+字段
+说明
+status
+无
+页面状态（URL、viewport、canvas、WebGL、Cocos 运行状态、readiness）
+screenshot
+format png/jpeg，默认 png
+截图；base64 作为 image artifact 返回，结构化数据里剔除 base64
+dom
+selector 可选(≤500)；maxDepth 0..8，默认 5
+DOM 摘要（有界、脱敏）
+find
+text 1..500；limit 1..100，默认 20
+按文本找元素
+inspect
+selector 1..500
+检查单个元素
+执行前校验连接；整体用 withOperation 串行化。
+4.3 browser_interact — 交互输入
+文件：src/application/modules/browser-interact.ts
+id runtime.browser-interact；profiles ["core","runtime","full"]；risk execute。
+单步 action（singleActionSchema）：
+action
+字段
+click
+selector 或 x+y（二选一，refine 校验）
+drag
+fromX/fromY/toX/toY finite；durationMs 0..5000 默认 300；steps 1..60 默认 12
+type
+selector；text≤10000；clear 默认 true
+key
+key str 1..50
+scroll
+x/y finite；deltaX 默认 0；deltaY 可选
+wait
+durationMs 0..60000
+批量：action:"batch"，steps 1..50 个单步，stopOnError 默认 true。批量把多步合并成一次工具调用，消除 MCP 层多次往返。
+安全设计：
+执行前用 connectionStatus() 校验已连接；
+用 sameTarget（:69-73）在操作前后比对 connected/transport/target.id，变更则报 REVISION_CONFLICT；
+整体用 withOperation 串行化；
+不提供脚本执行、刷新、导航、localStorage 修改入口。
+坐标均为当前页面 CSS viewport 坐标，超出会被 assertViewportPoint 拒绝。Canvas 内按钮没有 DOM 选择器时用坐标点击。
+4.4 browser_monitor — 事件监控（游标式读取）
+文件：src/application/modules/browser-monitor.ts
+id runtime.browser-monitor；profiles ["runtime","core"]；risk process；annotations readOnlyHint:true。
+输入 action：
+action
+字段
+说明
+start
+无
+开启 console / 异常 / Promise rejection / 网络订阅
+status
+无
+查询监控状态
+snapshot
+afterCursor int≥0 默认 0；limit 1..200 默认 100
+按游标读取新增事件
+stop
+无
+关闭订阅（保留页面与连接）
+clear
+无
+清空缓存事件
+游标机制：start 后记下 nextCursor-1 作为起点；每次 snapshot 传上次保存的 nextCursor 避免重复分析。当请求的 afterCursor < droppedBeforeCursor 时，返回 BROWSER_MONITOR_EVENTS_DROPPED warning（说明有事件被挤出缓冲区）。
+零配置启动逻辑（:38-50）：若 CDP 未连接，start 会尝试 cdp.list(9222) 取第一个非 devtools:// 页面并自动连接。
+生命周期：stop 关闭 Runtime/Log/Network 订阅；连续 5 分钟没有 start 或事件读取时自动停止（idle 定时器，见 browser-monitor-subscription.ts）。状态查询和页面自身日志不会延长这个时间。
+容量：事件缓存和未完成请求记录各最多 1000 条。
+4.5 browser_investigate — 一键诊断（采集+复现+假设）
+文件：src/application/modules/browser-investigate.ts
+id runtime.browser-investigate；profiles ["runtime","core","full"]；risk execute。
+输入 action：
+action
+字段
+observe
+detail full/summary 默认 full；durationMs 0..60000 默认 10000；includeScreenshot/includeDom/includeNetwork 默认 true；editorAfterCursor int≥0 默认 0
+reproduce
+detail；steps 1..50 个交互步骤；同样三个 include 开关；editorAfterCursor
+执行流程（:30-108）：
+校验连接（否则 PROVIDER_UNAVAILABLE）；withOperation + ensureTarget 守卫；
+采集前 pageStatus() + dom()；
+根据 transport 调 useCompanion() 或 useChrome() 激活对应 monitor；
+monitor.start()，记 startCursor；
+observe → cdp.wait(durationMs)；reproduce → 逐步执行 click/drag/type/key/scroll/wait 并记录 steps；
+采集后 pageStatus()、monitor.read(startCursor,200)、按目标过滤事件、可选截图（cdp.screenshot("png") → image artifact）、可选 domAfter；
+diagnose 生成假设；无 diagnose 时 buildHypotheses（:120-129）按规则产出：BROWSER_UNCAUGHT_EXCEPTION(.97) / BROWSER_EXISTING_ERROR(.96) / BROWSER_NETWORK_FAILURE(.82)；
+summarizeDiagnostic 按 detail 输出；finally 里恢复 monitor。
+返回大对象：before/after/beforeDom/afterDom/steps/events/existingErrors/coverage/hypotheses/nextCursor/warnings + 截图 artifact + evidence。
+推荐先传 detail:"summary"：摘要结果 JSON 上限 32 KiB，截图单独返回，截断和省略数量明确标注。
+4.6 browser_performance — 性能追踪
+文件：src/application/modules/browser-performance.ts
+id runtime.browser-performance；profiles ["runtime","core"]；risk process。
+预算字段 budgets：maxDurationMs(100..60_000)、maxEvents(1..100_000)、maxBytes(1024..32MiB)，均可选。
+输入 action：
+action
+字段
+start
+budgets + filePath 可选(≤2000) + includeScreenshots 默认 true
+sample
+budgets + durationMs 100..60000 默认 1000 + filePath + includeScreenshots
+stop
+无
+status
+无
+mark
+name str 1..200
+analyze
+traceId uuid + markerWindowMs 10..5000 默认 100
+关键约束：ensurePerformanceConnection（:109-121）只允许 chrome-cdp / chrome-companion，GameView 不支持性能追踪。
+mark 通过注入 performance.mark + console.timeStamp 表达式实现。
+analyze 调 artifacts.analyze(traceId, markerWindowMs)：只分析本项目登记、校验过 sha256 的 trace，不接受任意路径。
+5. 连接决策大脑：src/application/browser-connection.ts（205 行）
+这是「接线」逻辑的核心，6 个工具里凡是要接浏览器的，最终都汇总到这里。
+5.1 七个 action 的分派（connectBrowserPage）
+action
+行为
+备注
+current (:175-181)
+要求 cdp.connectExistingChrome，原生接管当前 Chrome
+保留 DevTools/登录态，不启动新浏览器、不回落 Bridge；不支持则 PROVIDER_UNAVAILABLE
+connect (:182-185)
+需 targetId，按 id/identity 选目标 → 进入恢复流程
+launch (:186-191)
+cdp.launch(url ?? resolvePreviewUrl())
+新开专用 Chrome
+adopt (:192-196)
+校验 URL → connectWithRecovery(..., selectPage)
+CDP Bridge 接管已打开网页
+disconnect (:197-202)
+cdp.disconnect() + useCreator()
+回到 GameView
+status (:203)
+cdp.connectionStatus()
+5.2 目标选择优先级
+normalizeUrl（:38-48）：去 hash、去默认端口 80/443、去尾斜杠，用于 URL 身份比对。
+isCocosPreviewUrl（:57-64）：localhost/127.0.0.1 且端口 7456。
+channelOf(target)（:66-68）：id.startsWith("companion:") → companion，否则 chrome。
+selectPage（:70-82）：过滤 type==="page" 且 HTTP(S) 的页面；多个候选时优先级 active → 7456 Preview → connected；仍多个则抛 AMBIGUOUS_REFERENCE。
+orderedCandidates（:88-103）：同通道优先、再跨通道——先尝试与原目标相同通道的候选，再试其他通道，减少跨通道抖动。
+5.3 重试与恢复（connectWithRecovery，:134-172）
+端口集合 = 去重([input.port ?? 9220, 9220])
+循环 attempt = 0..3（RETRY_DELAYS = [200, 500, 1000] ms）：
+  ├─ 对每个 port 调 cdp.list(port)，汇总 latestTargets + targetPorts(id→port)
+  ├─ select(latestTargets) 选目标；original ??= selected（锁定首次选择）
+  ├─ orderedCandidates(...) 排候选
+  ├─ 逐候选：
+  │    ├─ companion: 固定用 9220；其余用 targetPorts 或 input.port
+  │    ├─ cdp.connect(port, id)
+  │    ├─ activateMonitoring（按 status.transport 切到对应 monitor）
+  │    └─ 成功即返回
+  └─ 无 target 且无候选 → NOT_FOUND
+全部失败 → recoveryError（汇总 relayAvailable、availableChannels、最近 3 个错误）
+recoveryError（:116-126）：如果 relayAvailable===false，提示「CDP Bridge 9221 relay 不可用」；否则提示「已刷新页面目标并完成 3 次恢复尝试」。
+防串扰：beginOperation/isCurrent（:23-32）用 WeakMap 记录连接代次（revision），异步连接完成时若代次已变则放弃，避免旧连接覆盖新连接。
+6. 领域端口（Domain Port）速查
+6.1 BrowserCdpPort（browser-cdp-port.ts:40-67）
+统一页面端口，三条通路的适配器都实现它：
+类别
+方法
+串行化/批处理
+withOperation?、withInputBatch?
+连接
+list、connect、launch、connectExistingChrome?、connectionStatus、disconnect、dispose
+只读
+pageStatus?、screenshot?、dom?、find?、inspect?
+交互
+click?、clickAt?、drag?、type?、key?、scroll?、wait?
+脚本/性能
+executeScript?、performanceStartTrace?、performanceStopTrace?、performanceStatus?
+主要数据类型：
+ChromeCdpTarget（:3-17）：id/type/title/url/faviconUrl?/webSocketDebuggerUrl?/connected/tabId?/windowId?/active?/protocolVersion?/extensionVersion?/capabilities?
+ChromeCdpStatus（:28-38）：connected/reconnecting?/devToolsCompatible?/host/transport?/port?/target?/launched/processId?
+BrowserPageStatus（:69-97）：viewport/document/canvas/webgl/webglKnown/webglStatus/readiness/cocos{isPreview,runtimeDetected,blankCanvas,gameCanvasCount,entryReady,loadingStage,playing,paused,scene,designResolution,gameResolution}。注意 webglKnown=false 表示「未观测」，旧客户端只看 webgl 布尔值。
+BrowserScreenshot（:98）：base64/mimeType/width/height/path + 证据元数据。
+BrowserPerformanceTraceStatus/Result/StartOptions（:113-156）：trace 状态与结果，含 stopReason/completionConfirmed/sha256/truncated/limitations 等。
+6.2 BrowserMonitorPort（browser-monitor-port.ts）
+事件类型 BrowserMonitorKind = console|exception|promise-rejection|network（:2-6）。
+BrowserMonitorEvent（:8-29）：cursor/timestamp/source:"browser"/kind/level/message/stack?/url?/line?/column?/count?/parameters?/request?{url,method,status,errorText,durationMs,resourceType}。
+BrowserMonitorPage（:31-43）：events/nextCursor/droppedBeforeCursor/existingErrors?/coverage?。
+BrowserEvidenceMetadata（:63-68）：executionTarget?/transport?/observedAt?/collectionSource?，其中 collectionSource 取值 page-state|cocos-overlay|browser-cache|cdp-event，用于标注证据来源。
+端口方法：start/stop/status/read/clear。
+6.3 TRACE_LIMITS（browser-trace-limits.ts）
+{ maxDurationMs: 60_000, maxEvents: 100_000, maxBytes: 32 * 1024 * 1024 }
+TraceStopReason = manual|duration-limit|event-limit|byte-limit|buffer-limit。
+7. 基础设施适配器详解（src/infrastructure/creator/）
+7.1 连接与发现
+browser-discovery.ts（98 行）
+discoverChromePages(port, ownedPort?, connectedId?)（:6-45）：用 CDP.List({host:'127.0.0.1',port}) 发现页面，3000ms 超时；过滤 type==='page' && isWebPageUrl(url)；映射成 ChromeCdpTarget。当 port===9220 时额外并入 listBridgeTabs(port)（:32-35）。
+browserDeadline<T>（:47-59）：Promise.race 超时控制。
+listBridgeTabs(port)（:61-98）：用独立的浏览器 socket 发送 Tab.getMuteStatus {cdpOnly:false} 枚举 Bridge 标签，结果带 tabId。注释强调「清单不能复用 page session」。
+existing-chrome-connection.ts（75 行）— 原生接管当前 Chrome
+chromeUserDataDirectory()（:12-16）：按平台定位 Chrome 用户目录。
+parseExistingChromeEndpoint(contents)（:18-26）：解析 DevToolsActivePort 文件，校验端口（排除 9220/9221）和 /devtools/browser/[\w-]+ 路径，返回 ws://127.0.0.1:{port}{path}。
+ExistingChromeConnection（:29-75）：
+open(directory)：读 DevToolsActivePort → CDP({local:true, target:endpoint})，最多等 60s 授权；
+list()：Target.getTargets() 过滤 page + HTTP(S)；
+attach(targetId)：Target.attachToTarget({flatten:true}) → createCdpPageSession(browser, sessionId, false)。
+提示用户开 chrome://inspect/#remote-debugging（:10）。
+browser-chrome-support.ts（34 行）
+findChrome(explicit?)：在 ProgramFiles / ProgramFiles(x86) / LOCALAPPDATA 找 chrome.exe。
+findFreePort(start)：从 start 起找 100 个内可用端口（launch 默认从 9222 起）。
+ensureRuntimeDependencies(packageRoot)：检查 chrome-remote-interface / zod，缺失时 npm install --ignore-scripts。
+cdp-page-session.ts（85 行）
+createCdpPageSession(browser, sessionId, closeBrowser=true)：用 Proxy 把命令和事件限定到单个 flattened page session。
+isPageMethod（:4）：/^[A-Z][\w]+\.[\w]+$/ && !/^(Browser|Target)\./；
+send 给 page 方法自动带 sessionId；subscribe/remove 按 sessionId 过滤事件；
+close 做 Target.detachFromTarget（1.5s 超时）并清理监听。
+cdp-tunnel-session.ts（63 行）— CDP Bridge 接管的关键
+TUNNEL_RELAY_PORT = 9221（:4）。connectTunnelPage(port, targetId)（:7-50）：
+CDP.Version({port}) 取 webSocketDebuggerUrl（:10），校验本地 browser socket 与 /devtools/browser/ 路径（:15-17）；
+连接该 browser socket（:23-25）；
+Target.attachToTarget({flatten:true})（:32）；失败且 port===9220 且路径非 /client 时，回退到 ws://127.0.0.1:9221/client（:34-43）；
+返回 createCdpPageSession(browser, attached.sessionId)。
+注释解释（:18-20）：9221 的 create 端点在多客户端间共享端口池，request id 会碰撞，所以现有页接管走 advertise 端点。
+browser-cdp-router.ts（198 行）— 页面/操作路由器
+BrowserCdpRouter implements PagePort（:31）：持有 creator/chrome/companion? 三个 PagePort，active 默认 creator。
+切换：useCreator/useChrome/useCompanion/usingChrome/usingCompanion（:46-65）、beginConnection（:67-69，递增 connectionRevision 防竞态）。
+list(port)（:75-93）：chrome.list + companion.list 合并去重，按 scoreTarget 排序；记录 lastRelayAvailable / lastListErrors。
+connect(port,targetId)（:95-115）：companion: 前缀走 companion，否则 chrome；校验 revision 后才切换 active。
+connectionDiagnostics()（:117-124）：relayAvailable/targetCount/companionAvailable/listErrors。
+scoreTarget（:189-191）：active 8 + connected 4 + :7456 2 + companion 1。
+其余方法转发到 active；executeScript/performance* 在 active 不支持时抛错。
+7.2 Companion 通道（旧扩展）
+browser-companion-protocol.ts（151 行）
+BrowserCompanionTarget（:3-14）、消息类型 hello|heartbeat|response|event|detached（:16-21）。
+websocketAccept(key)（:23-27）：SHA1 + magic GUID → base64。
+websocketFrame(value)（:29-46）：构造服务端文本帧（含 126/127 长度分支）。
+WebsocketFrameDecoder（:48-104）：解析带掩码的客户端帧，处理分片/控制帧。
+parseCompanionMessage（:106-147）：按 type 解析并做边界裁剪（message≤4000、stack≤12000、capabilities≤32 等）。
+browser-companion-server.ts（206 行）— MCP 内置 WS 服务器
+COMPANION_EXTENSION_ORIGIN = "chrome-extension://dhaalkiblbgobpgkhkegelpbomjghang"（:20，旧 Companion 扩展 ID）。
+attach(nodeServer, authToken)（:34-42）：监听 HTTP upgrade；15s 周期检查陈旧 socket。
+request(method, params, timeoutMs=10000)（:66-82）：分配 id、登记 pending、写 {"type":"command",id,method,params} 帧。
+handleUpgrade（:106-134）：校验 path /browser-companion 且（token 或 origin 合法）、sec-websocket-key、返回 101 + websocketAccept。
+handleMessage（:152-179）：heartbeat 更新时间、hello 设 target、response resolve/reject pending、event 广播、detached 标记 attached:false。
+45s 无心跳销毁 socket。
+挂载链路：container-http-host.ts:21 → container.ts:170 → http-host.ts:103（options.browserBridge?.attach(nodeServer, options.authToken)）。Companion WS 与 MCP HTTP 共用同一 Node server / 端口 / authToken。
+browser-page-companion.ts（273 行）
+TARGET_ID_PREFIX = "companion:"（:22）；BrowserCompanionPage implements BrowserCdpPort（:30）。
+list（:65-68）：server.getTarget → 前缀 id。connect（:70-87）：未 attach 时发 CocosMcp.attach（带 tabId）。launch（:89-91）明确不支持。
+connectionStatus（:93-102）：host / transport 均为 chrome-companion。
+pageStatus（:115-123）：evaluate(buildBrowserPageStatusProbe({isPreview:true,...}))。
+screenshot（:125-137）：Page.captureScreenshot → 落盘 temp/cocos-mcp/screenshots，保留最近 20。
+DOM/交互：Runtime.evaluate 有界脚本 + CDP Input.dispatchMouseEvent/insertText/dispatchKeyEvent，坐标经 assertViewportPoint。
+command/evaluate（:243-252）：Runtime.evaluate {returnByValue,awaitPromise,userGesture}，检查 exceptionDetails。
+browser-monitor-companion.ts（192 行）
+MAX_EVENTS = 1000（:9）。
+start（:27-37）：Runtime.enable/Log.enable/Network.enable。
+事件源 onEvent（:76-128）：consoleAPICalled→console、exceptionThrown→exception/promise-rejection、Log.entryAdded、Network.requestWillBeSent/loadingFailed/responseReceived（HTTP≥400）。
+append（:130-137）：脱敏（Bearer/token/password/secret）、消息≤4000、栈≤12000，环形缓冲淘汰。
+7.3 Electron 通道（GameView）
+browser-page-electron.ts（387 行）
+TARGET_ID = "creator-gameview"（:22）；通过 CreatorElectronRuntime.resolveDebugTarget() 拿 ElectronDebugTarget，用 contents.executeJavaScript 与 contents.sendInputEvent。
+connectionStatus（:84-92）：transport creator-gameview，恒 connected。
+screenshot（:111-137）：contents.capturePage(bounds) → toPNG()/toJPEG(90) 落盘。
+DOM/交互：executeJavaScript 有界脚本；sendInputEvent 事件序列（mouseMove/Down/Up、mouseWheel、keyDown/Up）。
+type（:253-266）：通过 prototype value setter + 派发 input/change 事件。
+browser-monitor-electron.ts（317 行）
+常量 MAX_EVENTS=1000/MAX_TEXT=4000/MAX_STACK=12000/MAX_URL=500（:22-25）。
+start（:76-116）：contents.debugger.attach("1.3")，enable Runtime/Log/Network，captureExistingErrors。
+read（:135-152）：返回 events + existingErrors + coverage（sources 含 cocos-overlay 时标注）。
+captureExistingErrors（:167-181）：Runtime.evaluate(buildExistingErrorProbe()) 读取 Cocos 错误遮罩。
+append（:228-242）：区分 cached（browser-cache，cursor=0）/ 新事件（cdp-event），脱敏、截断、缓冲上限。
+sanitizeUrl（:297-307）：把 query 参数值替换为 [redacted]（比 CDP 更严格）。
+debugger-electron.ts（1010 行）— 与浏览器连接相关但用途不同
+这是 Cocos 源码断点调试器（服务于 debug_session/debug_breakpoint 工具），共用 Electron debugger attachment 机制，不属于浏览器页面采集路径。注意：browser-monitor-electron 与它互斥占用同一 debugger——两者 attach 都会因「already attached」报错。
+7.4 Chrome CDP 直连（核心大文件）
+browser-monitor-cdp.ts（566 行）
+ChromeCdpBrowserMonitor implements BrowserMonitorPort, BrowserCdpPort（:31）——一个端口同时承担 CDP 连接与监控，是 BrowserCdpRouter 和 BrowserMonitorRouter 的 chrome 实参。
+连接：
+list(port)（:97-101）：nativeConnection 命中用 Target.getTargets，否则 discoverChromePages。
+connectExistingChrome(url?)（:103-142）：ExistingChromeConnection.open() → list → 精确匹配 URL（默认 :7456）→ attach → 替换会话。
+connect(port,targetId) → connectPage（:150-183）：原生 → 9220 tunnel → 普通 CDP({target}) 三选一建立 client，attachEvents()。
+launch(url?) / launchChrome（:185-226）：findChrome + findFreePort(9222) + --remote-debugging-port，独立 user-data-dir，15s 内轮询连接。
+生命周期：start/startMonitoring（:228-259，enable Runtime/Log/Network/Page + 读 existing errors）、stop、read（含 coverage）、clear。
+页面读取/交互：evaluate（:295-313，3s deadline，TIMEOUT 触发 recoverPage）、executeScript、pageStatus、screenshot（Page.captureScreenshot + saveBrowserScreenshot）、dom/find/inspect/uniqueVisible、交互方法。
+性能：performanceStartTrace（先 readTraceFrameId）、performanceStopTrace、performanceStatus。
+断线/重连：recoverPage（:459-470）、attachEvents（:475-501，guarded Proxy 过滤旧连接事件）、scheduleReconnect（:503-547，最多 8 次、退避 min(2000,250*n)，按 target id 或唯一 URL+title 重附着）。
+append（:548-561）：去重计数（相同 kind/message/url/line/column/target/source 合并 count）、cached 逻辑、上限淘汰。
+7.5 路由与订阅辅助
+browser-monitor-router.ts（24 行）：useChrome/useCreator/useCompanion 切换前先 stop 旧 active（:10-16）；cdp() 把 chrome monitor 当 BrowserCdpPort 返回。
+browser-monitor-subscription.ts（36 行）：requested/revision/timer；仅当设置 idleTimeoutMs 且 requested 时启动 idle stop 定时器。注释「显式监控默认常驻，有界消费者可 opt-in」。
+browser-monitor-event-format.ts（9 行）：normalizeLevel/formatRemoteValue/locationFromDetails/locationFromStack/stackFromFrames/sanitizeUrl/redact。
+7.6 交互输入 / 截图 / WebGL
+browser-input.ts（29 行）：assertViewportPoint（坐标必须在 viewport 内）、normalizeScroll（两参旧语义 y 作 deltaY）、boundedDrag（duration 0..5000、steps 1..60）、dragPoint（线性插值）。
+browser-screenshot-artifact.ts（13 行）：saveBrowserScreenshot（落盘 %TEMP%/cocos-mcp/screenshots/browser-{ts}.{ext}，保留最近 20）。
+browser-webgl-observation.ts（31 行）：PASSIVE_WEBGL_OBSERVATION_SCRIPT——被动读取引擎已有 device，不新建 context，判断 webgl/webglKnown/webglStatus。
+browser-page-status-script.ts（77 行）：buildBrowserPageStatusProbe(options) 内联大段 JS，采集 canvases、Cocos engine（cc/internal.cc）、scene/playing/paused/designResolution、readiness、cocos 子结构，并拼接 WebGL 脚本。
+7.7 性能追踪
+browser-performance-trace.ts（263 行）：BrowserPerformanceTrace（:57）。
+start（:65-131）：Tracing.start {transferMode:"ReportEvents", bufferUsageReportingInterval:250, traceConfig.recordMode:"recordUntilFull", includedCategories, traceBufferSizeInKb}，:110-118。
+stop/finish（:133-203）：Tracing.end + 等 Tracing.tracingComplete，sha256、limits、stopReason、completionConfirmed。
+autoStop（:243-251）：buffer≥95% / event / byte / duration 触发。
+traceCategories（:254-263）：含 disabled-by-default-devtools.screenshot。
+默认最小 256 KiB Chrome 缓冲，保证能取得可处理事件。
+browser-trace-transport.ts（25 行）：bindBrowserTraceTransport 把订阅绑定到固定 client。
+browser-trace-writer.ts（40 行）：BrowserTraceWriter 逐事件同步写文件，不驻留数组；检查 maxBytes。
+browser-trace-frame.ts（21 行）：readTraceFrameId（Page.getFrameTree 2s 超时，取 frame id 做归因）。
+browser-trace-analysis.ts（72 行）：analyzeBrowserTrace：frameId → rendererPids → CrRendererMain 线程归因，归并 X/B/E 事件为 spans，产出 longTasks(>50ms)、topEvents、markers、frames（需≥3 个呈现事件）、rootCauseVerification:"candidate"。
+browser-trace-artifacts.ts（32 行）：register（仅 completionConfirmed，30min 过期、最多 32 条）、analyze（校验项目归属、文件 sha256、大小，有界 JSON 解析≤32MiB）。
+7.8 异常分类
+browser-exception-kind.ts（5 行）：browserExceptionKind(text)——uncaught (in promise) / unhandled promise rejection → "promise-rejection"，否则 "exception"。
+browser-existing-errors.ts（43 行）：buildExistingErrorProbe()（只读 DOM 脚本，扫 [id*="error"],[class*="error"] 可见节点提取错误文本）；normalizeExistingErrors(raw, metadata)（去重、脱敏、最多 20 条、collectionSource:"cocos-overlay"）。
+8. 从浏览器获取信息的完整手段（核心）
+信息类型
+获取手段
+通过通道
+关键文件:行号
+页面状态 / DOM / 元素
+Runtime.evaluate 注入有界脚本；GameView 用 executeJavaScript
+全三路
+browser-page-status-script.ts:3、browser-page-companion.ts:139-155、browser-page-electron.ts:139-221、browser-monitor-cdp.ts:394-418
+console 日志 / 异常 / Promise rejection / 网络失败
+CDP 事件订阅 Runtime.consoleAPICalled、Runtime.exceptionThrown、Log.entryAdded、Network.requestWillBeSent/loadingFailed/responseReceived
+全三路
+browser-monitor-cdp.ts:489-499、browser-monitor-companion.ts:76-128、browser-monitor-electron.ts:59-70,183-226
+已有历史错误
+buildExistingErrorProbe() 读 Cocos 错误遮罩 DOM（cocos-overlay）；失败回退浏览器缓存（browser-cache）
+全三路
+browser-existing-errors.ts:4-25、browser-monitor-cdp.ts:249-256、browser-monitor-electron.ts:167-181
+异常类型细分
+browserExceptionKind(text) 区分 exception / promise-rejection
+全三路
+browser-exception-kind.ts:2-5
+截图
+CDP Page.captureScreenshot（cdp/companion）；Electron contents.capturePage（gameview）；落盘保留 20 张
+全三路
+browser-monitor-cdp.ts:380-392、browser-page-companion.ts:125-137、browser-page-electron.ts:111-137、browser-screenshot-artifact.ts:5-13
+WebGL 状态
+被动读引擎已有 device，不新建 context；作为 pageStatus 一部分
+全三路
+browser-webgl-observation.ts:2-31、browser-page-status-script.ts:9,65
+Canvas / Cocos 运行状态
+读 cc.director.getScene()、isPaused、designResolution、blankCanvas、readiness
+全三路
+browser-page-status-script.ts:15-74
+性能 trace
+Tracing.start/end + Tracing.dataCollected，写 DevTools 兼容 JSON，分析 long tasks / 帧
+仅 chrome-cdp / chrome-companion（GameView 不支持）
+browser-performance-trace.ts:65-263、browser-trace-writer.ts、browser-trace-analysis.ts:25-72
+交互输入
+CDP Input.dispatchMouseEvent/insertText/dispatchKeyEvent；Electron sendInputEvent
+全三路
+browser-monitor-cdp.ts:426-432、browser-page-companion.ts:157-206、browser-page-electron.ts:231-285
+任意脚本求值（受限）
+Runtime.evaluate / executeJavaScript，长度≤MAX_PAGE_SCRIPT_LENGTH、超时、结果有界
+全三路
+browser-monitor-cdp.ts:315-335、browser-page-companion.ts:219-229、browser-page-electron.ts:298-303
+8.1 安全与脱敏（贯穿所有通道）
+URL query 参数值替换为 [redacted]（browser-monitor-event-format.ts:9、browser-monitor-electron.ts:303）；
+Bearer/token/password/secret 正则脱敏（三个 monitor 实现都有：companion :187-188、electron :310-313、cdp 复用 event-format :10）；
+DOM 属性过滤与密码值 [redacted]（browser-page-*.ts 的 dom/inspect）；
+事件有界：message≤4000、stack≤12000、缓存≤1000 条；
+trace 只登记本项目且校验 sha256（30min 过期、最多 32 条）；
+证据只属于当前项目和原采集目标，不能传任意文件路径。
+8.2 统一调用链示例：一键诊断（CDP 通路）
+AI 调 browser_investigate(reproduce)
+  → 已 connect（chrome-cdp）
+  → BrowserCdpRouter.active = ChromeCdpBrowserMonitor
+  → useChrome() → BrowserMonitorRouter.useChrome()
+  → monitor.start() → attachEvents() 订阅 CDP 事件
+  → cdp.pageStatus()      [Runtime.evaluate → WebGL/Canvas/场景/readiness]
+  → cdp.dom() + 交互 cdp.click/drag/...
+  → monitor.read(startCursor) → 事件流(console/exception/network) + existingErrors
+  → cdp.screenshot() → Page.captureScreenshot → image artifact
+  → diagnose() → buildHypotheses/假设排序 → summarizeDiagnostic(full|summary)
+  → 返回 {before,after,steps,events,existingErrors,coverage,hypotheses,nextCursor,warnings} + 截图
+9. 浏览器插件端与端口隧道（browser-companion/）
+9.1 两套扩展对比
+CDP Bridge（推荐）
+Cocos MCP Browser Companion（旧兼容）
+扩展 ID
+hcbkmdhlajamkfdjcbokidiamdjgffid
+dhaalkiblbgobpgkhkegelpbomjghang
+来源
+第三方 cdp-tunnel 包，安装脚本获取
+本项目自带（manifest.json / service-worker.js）
+连接方式
+扩展连 relay ws://localhost:9221/plugin；MCP 用 chrome-remote-interface 连 9220/9221 标准 CDP 端点
+扩展直连 MCP WS /browser-companion，用 chrome.debugger 转发
+transport 值
+chrome-cdp
+chrome-companion
+接管任意 HTTP(S) 页
+支持（host_permissions <all_urls>）
+仅 7456 Preview
+是否需重启 Chrome
+首次安装需要（企业策略）
+需要（--load-extension 或策略）
+9.2 旧 Companion 扩展文件
+manifest.json：MV3，权限 debugger/tabs/storage/alarms，host_permissions 仅 7456，version 0.2.10，service_worker service-worker.js。
+service-worker.js（276 行）：
+DEFAULTS = {host:'127.0.0.1', port:8765, token:''}、PROTOCOL_VERSION=1、CAPABILITIES=['Runtime','Log','Network','Page','Input']；
+connect()：连 ws://{host}:{port}/browser-companion?token=...；alarm 心跳 0.333 分钟；
+announcePreviewTab()：查 7456 标签，发 hello（含 tabId/windowId/active/attached/protocolVersion/extensionVersion/capabilities）；
+attachPreviewTab()：chrome.debugger.attach({tabId},'1.3')；
+handleCommand()：处理 CocosMcp.attach/detach、Target.detachFromTarget，其余透传 chrome.debugger.sendCommand，结果回 {type:"response",id,result/error}；
+chrome.debugger.onEvent → {type:"event",method,params}；onDetach → {type:"detached",reason}；
+badge 绿/灰图标。
+options.js：读写 host/port + token（默认 8765）。
+install.html：CDP Bridge 安装引导页。
+9.3 安装 / 打包 / 更新脚本
+脚本
+作用
+setup-browser-bridge.cmd
+提权入口，调 setup-browser-bridge.ps1，结果写 bridge-setup.log
+configure-browser-bridge.ps1
+面板「一键配置」调用；非管理员时 RunAs 提权
+setup-browser-bridge.ps1（172 行）
+7 步主流程：①查 node/npm/Chrome ②打包 CDP Bridge + 写 update ③起本地更新服务 8768 ④启动 9221 relay（cdp-tunnel/server/proxy-server.js）⑤写 Chrome 企业策略 ExtensionInstallForcelist ⑥关开 Chrome 等安装 ⑦校验。不强杀进程
+install-cdp-tunnel.cmd
+旧式提权安装：打包→起 8768→写策略→taskkill chrome→重开
+package-cdp-tunnel.cmd
+从 npm root -g/cdp-tunnel/extension-new 复制扩展；把 utils/config.js 的 ws://localhost:10108/plugin 改写为 ws://localhost:9221/plugin；用 Chrome --pack-extension 签 CRX
+verify-cdp-package.cjs
+verifyCdpPackage：校验 CRX3 头、签名、扩展 ID 与保留私钥一致
+write-cdp-update.mjs
+由私钥算扩展 ID，验签 CRX，写 extension-id.txt 和 update.xml（codebase http://127.0.0.1:8768/extension.crx）；ID 变更拒绝替换
+serve-cdp-update.mjs
+本地更新服务，暴露 /update.xml、/extension.crx、/health，默认 8768
+launch-companion-chrome.cmd
+用独立 .chrome-profile + --load-extension 启动加载旧 Companion 的专用 Chrome
+remove-legacy-companion.cmd
+删除旧 Companion 企业策略，保留 CDP Bridge
+install-policy.cmd / write-update.mjs / serve-update.mjs / package-companion.cmd
+旧 Companion 的打包、策略安装（默认 8766）、更新服务
+reset-browser-extensions.cmd/.ps1、update-companion.cmd/.ps1、serve-update.cmd
+扩展重置、更新辅助
+9.4 端口 9221 relay / CDP 隧道机制（重点）
+[扩展 CDP Bridge] --ws--> ws://127.0.0.1:9221/plugin   (config.js 被改写)
+                              |
+                  [cdp-tunnel proxy-server.js, PORT=9221]
+                              |
+      对外暴露 9220 标准 CDP 端点(/json/version → /devtools/browser/...)
+      及 9221 的 /client、/json/browsers 端点
+                              |
+[MCP chrome-remote-interface]
+    discoverChromePages(9220): CDP.List + Tab.getMuteStatus
+    → connectTunnelPage(9220, targetId):
+        CDP.Version → browser socket → Target.attachToTarget(flatten)
+        失败回退 ws://127.0.0.1:9221/client
+    → createCdpPageSession → transport = "chrome-cdp"
+关键点：扩展自身不暴露 CDP，而是作为「插件」连到 relay；relay 把多个 Chrome 标签伪装成标准 CDP browser/target 端点，MCP 用普通 chrome-remote-interface 即可接管已经打开、未带调试参数的 Chrome。这与旧 Companion（扩展直连 MCP WS、MCP 发命令给 chrome.debugger）在架构上完全不同。
+端口冲突处理：setup 脚本检测 9220/9221 被占用时，验证是否是可复用 relay（GET /json/browsers），否则停止并提示，不强杀。
+端口一览：
+8765（可配置到 8785）：MCP HTTP 服务 + Companion WS（共用）。
+8766：旧 Companion 更新服务。
+8768：CDP Bridge 本地更新服务。
+9220：CDP Bridge relay 暴露的标准 CDP 端点（默认接管端口）。
+9221：CDP relay 内部端口（/plugin 扩展接入、/client 接管回退）。
+9222：launch 新开 Chrome 的起始调试端口；browser_monitor start 零配置扫描端口。
+10. 配置与装配
+10.1 装配链路（src/bootstrap/container.ts）
+createContainer
+  ├─ browserMonitor          = new CreatorElectronBrowserMonitor(...)          :163-166
+  ├─ chromeBrowserMonitor    = new ChromeCdpBrowserMonitor(...)                :167-169
+  ├─ browserCompanion        = new BrowserCompanionServer()                    :170
+  ├─ companionPage           = new BrowserCompanionPage({server})              :171-174
+  ├─ companionMonitor        = new BrowserCompanionMonitor(browserCompanion)    :175
+  ├─ browserMonitorRouter    = new BrowserMonitorRouter(3 个 monitor)          :176
+  ├─ creatorBrowserPage      = new CreatorElectronBrowserPage(...)             :177-180
+  └─ browserCdpRouter        = new BrowserCdpRouter(creator, chrome, companion) :181-185
+6 个工具模块注册在 container.ts:349-384，其中 useChrome/useCreator/useCompanion 回调在 browserCdpRouter 与 browserMonitorRouter 间联动（:352-357, 377-382）。
+10.2 src/bootstrap/config.ts
+McpConfig 无浏览器专属字段；相关项：host 固定 127.0.0.1、port 默认 8765 / maxPort 8785、authToken（Companion WS 复用）、debuggerEnabled（控制 debug_session 注册）。端口/token 通过 COCOS_MCP_* 环境变量或 overrides 注入。
+10.3 package.json
+版本 0.3.4，Node ≥18。
+浏览器相关依赖：chrome-remote-interface ^0.34.0、zod 4.4.3、@jridgewell/trace-mapping ^0.3.31（都在 bundledDependencies）。
+files 打包 browser-companion/*.{json,html,js,css,cmd,ps1,mjs,cjs,md} + icons。
+contributes 面板方法：list-browser-targets/connect-browser/browser-page-status/browser-screenshot/browser-observe/browser-monitor-snapshot。
+11. 排错与自查清单
+11.1 接管已打开网页失败
+按 docs/CHROME_MONITOR.md:30 的顺序：
+确认已安装且启用唯一的 CDP Bridge 扩展（扩展 ID hcbkmdhlajamkfdjcbokidiamdjgffid）；旧 Companion 不需要同时装。
+确认 9221 relay 正在运行——setup-browser-bridge.cmd 启动的 cdp-tunnel/server/proxy-server.js。状态里 relayAvailable:false 就是它挂了。
+保持目标标签页打开，且是 HTTP(S) 页面。
+先 browser_connect list 扫描，看目标是否出现；多个页面时用完整 URL 或 targetId 指定。
+browser_connect adopt（可带 url）→ status 确认 transport: "chrome-cdp"。
+Chrome 显示「正在被调试」是 chrome.debugger 的系统行为，正常。
+托管策略安装出现「浏览器由组织管理」是正常的，不要用「加载已解压扩展」。
+11.2 定位界面报错
+browser_monitor start，记下返回的 nextCursor；
+在页面中只复现一次问题；
+browser_monitor snapshot 传入起始游标；
+异常和 Promise rejection 会返回 message/stack/url/line/column，console 事件保留有限参数。这样能区分本次复现的错误和接管前历史日志。
+11.3 版本信息不变
+Companion 握手会上报 protocolVersion / extensionVersion / capabilities。更新扩展后若版本信息没变，说明 Chrome 仍用旧 Service Worker——去 chrome://extensions 刷新扩展，或等企业策略更新完成。
+11.4 常见错误码
+错误码
+含义
+处理
+NOT_FOUND
+未找到可接管的 HTTP/HTTPS 网页
+确认 Bridge 已连接且页面打开，重新扫描或填完整 URL
+AMBIGUOUS_REFERENCE
+发现多个候选页面
+填 URL/标题，或扫描后按 targetId 连接
+PROVIDER_UNAVAILABLE
+能力不可用（如 GameView 上做性能追踪、current 不支持）
+换 chrome-cdp 通路
+REVISION_CONFLICT
+操作期间连接目标变化
+重新确认连接后重试
+TRANSPORT_ERROR
+连接恢复流程最终失败
+看 diagnostics 里的 relayAvailable / lastErrors
+EXECUTION_FAILED
+通用执行失败（未连接、monitor 未 active 等）
+检查连接/监控状态
+11.5 互斥与限制
+browser-monitor-electron 与源码断点调试器 debugger-electron 互斥占用同一 debugger。
+性能追踪不支持 GameView，只支持 chrome-cdp / chrome-companion。
+browser_interact 不提供脚本执行/刷新/导航/localStorage 修改——不要指望它做这些。
+帧间隔分析需要至少 3 个可归属的实际呈现事件，不能从 rAF / 截图数 / 设置 FPS 推断。
+堆快照、保留路径、完整内存泄漏分析要继续用 Chrome DevTools MCP。
+12. 附录
+12.1 已有官方文档
+文档
+内容
+docs/CHROME_MONITOR.md
+浏览器调试专题：三通路与 transport、Bridge vs Companion、monitor 游标、idle 自动停止、investigate/page/interact 用法、detail=summary、evidence_read 分页、性能预算与 analyze、接管排错顺序、Companion 握手版本、多页面 adopt 优先级
+docs/MCP_CAPABILITIES.md
+浏览器接管/诊断能力表、浏览器操作重点、profile 提示
+docs/ARCHITECTURE.md
+browser_monitor 工具说明、start 时建立一次 Electron CDP 会话、不轮询、URL 脱敏、readOnly 拒绝、统一 Browser CDP 端口
+browser-companion/README.md
+CDP Bridge 与旧 Companion 的区别、首次使用、一键配置、安装脚本说明
+browser-companion/INSTALL-MANAGED-CHROME.md
+托管 Chrome 环境下的扩展安装
+12.2 术语表
+术语
+含义
+transport
+浏览器通路类型：creator-gameview / chrome-cdp / chrome-companion
+CDP
+Chrome DevTools Protocol，Chrome 的标准调试协议
+CDP Bridge
+第三方 cdp-tunnel 扩展，可接管已打开的普通 Chrome
+Companion
+本项目旧版专用扩展通道，走 MCP 内置 WS
+relay
+cdp-tunnel 的中继服务（9221），把扩展标签伪装成标准 CDP 端点
+Port
+领域接口，统一三条通路的调用方式
+Router
+持有三个 Port 实现、按 transport 切换 active 的路由器
+active
+当前生效的通路
+cursor / nextCursor
+事件流的读取游标，避免重复分析
+droppedBeforeCursor
+已被挤出缓冲区的事件游标下界
+existingErrors
+接管前已存在的历史错误（来自 Cocos 错误遮罩）
+collectionSource
+证据来源标记：page-state / cocos-overlay / browser-cache / cdp-event
+traceId
+性能追踪记录 ID，用于 analyze
+flatten session
+CDP Target.attachToTarget({flatten:true}) 的会话，命令带 sessionId
+revision
+连接/操作代次，用于防异步串扰
+
+
+
+
+
+

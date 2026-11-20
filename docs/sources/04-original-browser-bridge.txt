@@ -1,0 +1,55 @@
+
+
+1. 
+在 discoverChromePages 调用 CDP.List({host:"127.0.0.1",port:9220})，等待最多 3 秒。过滤 type=page 且 URL 为 HTTP/HTTPS 的条目。将目录中的 id、URL、标题和可用的 active 复制到候选模型，用当前目标 ID 计算 connected。
+CDP 目录可能缺少某些已打开页签。参考实现额外建立一个临时浏览器 WebSocket，发送 Bridge 自定义命令 Tab.getMuteStatus({cdpOnly:false})。扩展侧通过 chrome.tabs.query 返回页签清单。发现层只取有效的数字 tab ID 和 URL，把尚未出现在 CDP 目录中的 HTTP/HTTPS URL 补进候选，同时保留原始 tabId。临时连接和命令各有 1.5 秒上限，补扫失败时保留已取得的 CDP 目录，补扫结束后释放临时连接。补扫按原始 URL 与主目录去重，主目录中同 URL 的不同目标仍可能并存。
+发现只读目标目录。业务调用用新附着的页面会话。继续在已附着的页签会话上发送补扫命令会混淆浏览器级命令和页面级命令。
+2. 
+adopt 适合已知目标 URL 或单个候选的场景。list 加 connect 适合已经在列表中确认确切页签的场景。列表点击时将扫描结果中的 targetId、URL 和标题传给主进程。调用方要保留返回的目标 ID 原样，恢复流程才能判断同一目标或识别重建页签。完整优先级、回退与歧义处理见 [05 目标选择与恢复](http://05-target-lifecycle.md)。
+数字字符串 ID 是 Bridge 提供的兼容形式。已核对的 cdp-tunnel@3.6.4 扩展会将数字字符串解析为 tabId，其他 ID 则用 chrome.debugger.getTargets() 查出对应 tabId。原生 Chrome 路线使用 Target.getTargets 给出的真实目标 ID。
+3. 
+1. 用选页时的端口读取 CDP.Version。Bridge 正常端口是 9220。校验回传的 webSocketDebuggerUrl 为 ws:、主机为 [localhost](http://localhost) 或 127.0.0.1、端口与发现端口一致、路径以 /devtools/browser/ 开头。连接时将主机统一为 127.0.0.1。
+2. 打开浏览器级 WebSocket，发 Target.attachToTarget({targetId,flatten:true})。relay 把请求转给已连接的扩展。扩展解析目标标识，调用 chrome.debugger 附着，记录 sessionId 到 tab 的映射，再把结果传回。附着路径执行的是已有页签连接。
+3. 只有已打开 9220 WebSocket 后执行附着失败，现有实现才关闭该连接，尝试旧版 ws://127.0.0.1:9221/client，并用同一目标 ID 重新附着。版本发现或初次 WebSocket 连接失败会返回给外层处理。日常接管使用 9220，因为 9221/client 与端口池的创建模式共用命名空间。
+4. 用 createCdpPageSession 包装浏览器连接和返回的 sessionId。Runtime、Page、Input、Network 等页面命令携带当前会话 ID，订阅的页面事件按相同 ID 过滤。Browser 和 Target 域走浏览器级会话。
+5. 路由记录当前目标和通道，结果应为 connected=true、transport=chrome-cdp。让 browser_page status 在该会话读取实际 URL 和标题作为第一次回读。需要持续抓事件时再调用 browser_monitor start。
+下列报文展示连接后出现的三个标识。JSONL 每行是独立样例，id 是命令与响应的匹配编号。
+```
+{"id":1,"method":"Target.attachToTarget","params":{"targetId":"37","flatten":true}}
+```
+{"id":1,"result":{"sessionId":"session-demo"}}
+{"id":2,"method":"Runtime.evaluate","params":{"expression":"document.title","returnByValue":true},"sessionId":"session-demo"}
+{"id":2,"result":{"result":{"type":"string","value":"Cocos MCP Browser Fixture"}},"sessionId":"session-demo"}
+4. 
+显式断开时停止旧目标的采集，清理会话监听，发送 Target.detachFromTarget({sessionId})。参考实现等待 detach 最多 1.5 秒，之后仍会释放它拥有的 WebSocket。收到对应页签的 detach 或浏览器 socket 断线时退出当前会话，并按 [05 目标选择与恢复](http://05-target-lifecycle.md) 决定是否重连。正常断开后路由回到 Creator GameView。关闭接管连接只处置调试资源，已有 Chrome 页签由用户继续使用。
+参考 [发现实现](https://boke.feishu.cn/extensions/cocos_mcp/src/infrastructure/creator/browser-discovery.ts)、[Bridge 附着](https://boke.feishu.cn/extensions/cocos_mcp/src/infrastructure/creator/cdp-tunnel-session.ts)、[CDP 会话代理](https://boke.feishu.cn/extensions/cocos_mcp/src/infrastructure/creator/cdp-page-session.ts)、[Chrome 扩展调试 API](https://developer.chrome.com/docs/extensions/reference/api/debugger)。
+先按下面的安装流程准备 Bridge，再打开 [验收测试页](http://10-verification-and-release.md#%E8%87%AA%E5%BB%BA%E9%A1%B5%E9%9D%A2%E9%AA%8C%E6%94%B6%E6%95%B0%E6%8D%AE)。以下 JSONL 可逐行传给 [MCP 会话脚本](http://02-mcp-service.md#codex-%E6%8E%A5%E5%85%A5%E4%B8%8E%E6%9C%80%E5%B0%8F%E8%B0%83%E8%AF%95)。
+```
+{"name":"browser_connect","arguments":{"action":"list","port":9220}}
+```
+{"name":"browser_connect","arguments":{"action":"adopt","port":9220,"url":"http://127.0.0.1:7457/"}}
+{"name":"browser_connect","arguments":{"action":"status"}}
+{"name":"browser_page","arguments":{"action":"status"}}
+{"name":"browser_connect","arguments":{"action":"disconnect"}}
+检查 list 的 URL，核对接管回执里的 target.id、target.url 和 transport，再用页面回读确认实际标题是 Cocos MCP Browser Fixture。需要精确选页时，用 {"action":"connect","port":9220,"targetId":"扫描返回的 ID","url":"[http://127.0.0.1:7457/](http://127.0.0.1:7457/)","title":"Cocos MCP Browser Fixture"} 替换 adopt。断开后确认测试页仍可由用户访问，并检查路由返回 GameView。
+1. 在 Creator 面板的 浏览器调试 → Chrome 插件配置 点击 一键配置，或运行配套的 setup-browser-bridge.cmd。脚本需要管理员授权来写入 HKLM\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist。
+2. 检查 Node/npm 和 Chrome。参考脚本在缺少 relay 时安装 cdp-tunnel@3.6.4，为 CDP Bridge 准备签名 CRX、扩展 ID 和 update.xml。
+3. 启动回环更新服务，检查清单与版本，并比对下载 CRX 和本地文件的 SHA-256。先探测 9220/9221，健康 relay 可复用，占用冲突时停止配置并显示原因。
+4. 写入策略并读回确认。等待目标 Chrome 用户配置安装扩展。首次安装或启用状态需要修复时，脚本可能正常退出并重新打开 Chrome。已有页面工作应先保存。
+5. 扩展就绪后打开一个测试页。面板应分别显示扩展启用、relay 运行、已有扩展连接，再执行 扫描页面 → 连接 或 接管已打开网页。日常故障先检查安装目录里的 bridge-setup.log。
+按浏览器配置读取已安装状态，自定义 --user-data-dir 需要单独核对。固定的扩展标识由签名确定，以打包结果为准。签名私钥属于安装端。参考 [安装说明](https://boke.feishu.cn/extensions/cocos_mcp/browser-companion/README.md)、[安装脚本](https://boke.feishu.cn/extensions/cocos_mcp/browser-companion/setup-browser-bridge.ps1)、[更新服务](https://boke.feishu.cn/extensions/cocos_mcp/browser-companion/serve-cdp-update.mjs)、[面板桥接状态](https://boke.feishu.cn/extensions/cocos_mcp/panels/default/browser-bridge-runtime.js)。
+需要接入现有 Companion 安装时，在 Creator 的 HTTP server 上增加 /browser-companion WebSocket 升级入口。现有实现接受固定扩展 Origin 或服务令牌，使用 hello 公布目标，分别处理心跳、命令响应、CDP 事件和 detach。命令以 ID 匹配响应，等待超时或连接断开时清理 pending 表。
+旧扩展以 service worker 查询适用的预览 tab，收到显式附着命令后调用 chrome.debugger.attach。服务端把该目标映射为 companion:… ID，连接时切换为 chrome-companion。回归时单独验证旧扩展的上报范围、默认 8765 和断开行为。推荐的 CDP Bridge 路线有独立 relay 和扩展分发。
+参考 [旧扩展](https://boke.feishu.cn/extensions/cocos_mcp/browser-companion/service-worker.js)、[旧服务端](https://boke.feishu.cn/extensions/cocos_mcp/src/infrastructure/creator/browser-companion-server.ts)、[消息协议](https://boke.feishu.cn/extensions/cocos_mcp/src/infrastructure/creator/browser-companion-protocol.ts)。
+在 PowerShell 中可用以下只读请求区分 relay、扩展连接和发现接口。页面目录只代表当前发现结果，仍需通过实际附着与页面回读验收。
+```
+Invoke-RestMethod -Uri 'http://127.0.0.1:9221/json/browsers' -TimeoutSec 3
+```
+Invoke-RestMethod -Uri 'http://127.0.0.1:9220/json/version' -TimeoutSec 3
+Invoke-RestMethod -Uri 'http://127.0.0.1:9220/json/list' -TimeoutSec 3
+- 以普通 Chrome 中的测试页验证扩展已启用、relay 有扩展连接、扫描找到了页签、附着后能读取页面。四项分别记录结果。
+- 模拟主目录为空、补扫返回数字 tab ID、补扫超时三种场景。确认补扫失败时还能使用主目录，临时 socket 正常或迟到返回时都能回收。
+- 对两个页签分别发送带不同 sessionId 的事件，确认监控只采集本会话。测试 9220 附着失败才回退到 9221/client，并检查旧连接释放。
+- 在两个页签间切换或主动断开，检查旧事件、旧截图回包和恢复任务不会修改当前目标状态。两张原页签均应继续存在。
+- MCP 的 Bearer 鉴权只覆盖 MCP 服务。已有 cdp-tunnel@3.6.4 的主 relay 和端口池源码监听 0.0.0.0。部署时单独核对 relay 的网络访问范围与主机防火墙，记录实际绑定与适用保护。
+用例 [Bridge 页签会话](https://boke.feishu.cn/extensions/cocos_mcp/tests/infrastructure/cdp-tunnel-session.test.ts)、[发现超时](https://boke.feishu.cn/extensions/cocos_mcp/tests/infrastructure/browser-discovery-timeout.test.ts)、[安装包核对](https://boke.feishu.cn/extensions/cocos_mcp/tests/panel/browser-bridge-package.test.ts)、[Companion](https://boke.feishu.cn/extensions/cocos_mcp/tests/infrastructure/browser-companion.test.ts)。

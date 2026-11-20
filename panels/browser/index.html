@@ -1,0 +1,43 @@
+<main>
+  <section aria-label="活动页签">
+    <header><h2>活动页签</h2><span id="state" role="status">正在读取…</span></header>
+    <div id="targetTitle">尚未选择页签</div>
+    <div id="targetUrl" class="mono"></div>
+    <div id="targetId" class="muted"></div>
+    <div id="connectionError" class="error" role="status"></div>
+    <div class="row">
+      <button id="read" disabled>读取页面信息</button>
+      <button id="disconnect" disabled>断开</button>
+    </div>
+  </section>
+  <section aria-label="选择页签">
+    <header><h2>选择页签</h2><button id="scan">扫描页签</button></header>
+    <div class="row">
+      <label for="port">CDP 端口</label>
+      <input id="port" type="number" min="1" max="65535" value="9220">
+      <button id="check">检查 Bridge</button>
+    </div>
+    <dl class="health">
+      <dt>Relay</dt><dd id="relay">待检查</dd>
+      <dt>Chrome 扩展</dt><dd id="extension">待检查</dd>
+      <dt>接管端点</dt><dd id="discovery">待检查</dd>
+    </dl>
+    <div class="row">
+      <select id="targets" aria-label="Chrome 页签列表"><option value="">请扫描页签</option></select>
+      <button id="connect" class="primary" disabled>连接所选页签</button>
+    </div>
+    <div class="row">
+      <input id="url" type="url" aria-label="按 URL 选择页签" placeholder="页签 URL（可选）">
+      <button id="adopt">接管已打开页签</button>
+    </div>
+    <div id="message" role="status" class="message"></div>
+  </section>
+  <section aria-label="MCP 服务">
+    <header><h2>本地 MCP</h2><button id="credentials" disabled>显示令牌</button></header>
+    <div id="service" class="mono">正在检查服务…</div>
+    <div id="tokens" hidden>
+      <label>控制令牌<input id="control" type="text" readonly></label>
+      <label>只读令牌<input id="readonly" type="text" readonly></label>
+    </div>
+  </section>
+</main>
