@@ -25,6 +25,7 @@
       "service-info": { "methods": ["serviceInfo"] },
       "mcp-credentials": { "methods": ["mcpCredentials"] },
       "bridge-status": { "methods": ["bridgeStatus"] },
+      "bridge-install-guide": { "methods": ["bridgeInstallGuide"] },
       "list-browser-targets": { "methods": ["listBrowserTargets"] },
       "connect-browser": { "methods": ["connectBrowser"] },
       "browser-page-status": { "methods": ["browserPageStatus"] }

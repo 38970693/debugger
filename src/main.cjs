@@ -1,4 +1,5 @@
 const { BridgeAdapter } = require('./bridge.cjs');
+const { InstalledBridgeAdapter } = require('./installed-bridge.cjs');
 const { ConnectionService } = require('./connection.cjs');
 const { McpHost } = require('./mcp.cjs');
 const { port, connection, BrowserError, result } = require('./contract.cjs');
@@ -9,10 +10,12 @@ let shutdown = Promise.resolve();
 
 function load() {
   if (runtime) return;
-  const service = new ConnectionService(new BridgeAdapter());
+  const bridge = new InstalledBridgeAdapter(new BridgeAdapter());
+  const service = new ConnectionService(bridge);
   const host = new McpHost(service);
   const current = { service, host };
   runtime = current;
+  void bridge.setup().catch(() => {});
   current.startup = shutdown.then(() => {
     if (runtime === current) return host.start();
   }).catch(() => {
@@ -52,6 +55,13 @@ const methods = {
   },
   bridgeStatus(input) {
     return result(() => currentRuntime().service.bridgeStatus(port.parse(input)));
+  },
+  bridgeInstallGuide() {
+    return result(async () => {
+      const { shell } = require('electron');
+      await shell.openExternal('https://github.com/dyyz1993/cdp-tunnel');
+      return true;
+    });
   },
   listBrowserTargets(input) {
     return methods.connectBrowser({ action: 'list', port: input });

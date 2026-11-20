@@ -9,7 +9,7 @@ const { metafile } = buildSync({
   target: 'node18',
   format: 'cjs',
   outfile: 'dist/main.js',
-  external: ['bufferutil', 'utf-8-validate'],
+  external: ['bufferutil', 'utf-8-validate', 'electron'],
   metafile: true,
 });
 

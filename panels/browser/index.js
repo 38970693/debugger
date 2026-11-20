@@ -33,7 +33,8 @@ function setup(panel) {
     const { title, url, id } = next.target ?? {};
     $.targetTitle.textContent = title || (id ? '无标题' : '尚未选择页签');
     $.targetUrl.textContent = url || '';
-    $.targetId.textContent = id ? `目标 ${id} · CDP ${next.port}` : '';
+    const channel = next.transport === 'chrome-tab-metadata' ? 'Chrome 页签信息' : `CDP ${next.port}`;
+    $.targetId.textContent = id ? `目标 ${id} · ${channel}` : '';
     $.connectionError.textContent = next.error || '';
     $.read.disabled = !next.connected;
     $.disconnect.disabled = !next.connected && !['connecting', 'reconnecting'].includes(next.state);
@@ -76,10 +77,16 @@ function setup(panel) {
     try {
       const bridge = await request('bridge-status', port);
       if (closed || port !== Number($.port.value)) return;
-      $.relay.textContent = bridge.relayAvailable ? '在线' : '未响应';
-      $.extension.textContent = bridge.extensionConnected === null ? '未知' :
-        bridge.extensionConnected ? '已联通' : '等待联通';
-      $.discovery.textContent = bridge.discoveryAvailable ? `可用${bridge.version ? ` · ${bridge.version}` : ''}` : '不可用';
+      $.relay.textContent = bridge.relayAvailable ? `在线${bridge.mode === 'metadata' ? ' · 18765' : ''}` : '未响应';
+      const installedVersion = bridge.extensionVersion ?? (bridge.mode === 'metadata' ? bridge.version : undefined);
+      const version = installedVersion ? ` · ${installedVersion}` : '';
+      $.extension.textContent = bridge.extensionConnected ? `已联通${version}` :
+        bridge.installed === 'installed' ? `已安装 · 等待联通${version}` :
+          bridge.installed === 'missing' ? '未发现 Bridge' : '等待联通';
+      $.discovery.textContent = bridge.discoveryAvailable ?
+        bridge.mode === 'metadata' ? '页签信息可用' : `可用${bridge.version ? ` · ${bridge.version}` : ''}` : '不可用';
+      $.install.hidden = bridge.installed !== 'missing' && (bridge.extensionConnected || bridge.mode === 'metadata');
+      if (bridge.issue) $.message.textContent = bridge.issue;
     } finally {
       if (!closed) $.check.disabled = false;
     }
@@ -142,11 +149,13 @@ function setup(panel) {
     }, { signal: handlers.signal });
   }
   on($.check, 'click', health);
+  on($.install, 'click', () => request('bridge-install-guide'));
   on($.scan, 'click', scan);
   on($.port, 'input', () => {
     targetList = [];
     $.targets.replaceChildren(new Option('请扫描页签', ''));
     $.connect.disabled = true;
+    $.install.hidden = true;
     for (const element of [$.relay, $.extension, $.discovery]) element.textContent = '待检查';
   });
   on($.targets, 'change', () => { $.connect.disabled = !$.targets.value; });
@@ -200,7 +209,7 @@ module.exports = Editor.Panel.define({
   $: Object.fromEntries([
     'state', 'targetTitle', 'targetUrl', 'targetId', 'connectionError',
     'service', 'credentials', 'tokens', 'control', 'readonly', 'message',
-    'port', 'check', 'relay', 'extension', 'discovery', 'scan', 'targets',
+    'port', 'check', 'install', 'relay', 'extension', 'discovery', 'scan', 'targets',
     'connect', 'url', 'adopt', 'read', 'disconnect',
   ].map((id) => [id, `#${id}`])),
   ready() {

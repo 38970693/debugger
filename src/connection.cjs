@@ -93,7 +93,7 @@ class ConnectionService {
     const current = this.active || this.recovering;
     return {
       state: this.state, revision: this.revision, connected: Boolean(this.active),
-      reconnecting: this.state === 'reconnecting', transport: 'chrome-cdp', launched: false,
+      reconnecting: this.state === 'reconnecting', transport: current?.page.transport ?? 'chrome-cdp', launched: false,
       ...(current ? { port: current.port, target: publicTarget(current.target) } : {}),
       ...(this.lastError ? { error: this.lastError } : {}),
     };
@@ -253,7 +253,7 @@ class ConnectionService {
     }
     if (this.active !== current || this.revision !== revision) throw REPLACED();
     current.target = { ...current.target, ...identity };
-    return { target: publicTarget(current.target), transport: 'chrome-cdp', port: current.port, revision };
+    return { target: publicTarget(current.target), transport: current.page.transport ?? 'chrome-cdp', port: current.port, revision };
   }
 
   disconnect() {
