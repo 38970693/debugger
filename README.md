@@ -14,6 +14,10 @@
 
 ### 2. 准备 Chrome CDP Bridge
 
+在 Creator 面板点「检查 Bridge」。Windows 上如果已安装兼容的 **CDP Bridge 2.4.0**，插件会自动准备它使用的本机端口 `127.0.0.1:18765`。等面板显示「已联通」后即可扫描页签。这个通道读取标题和 URL。如果显示等待联通，可刷新 Chrome 中的目标页签后再检查。
+
+使用标准 CDP 接管时，按以下步骤准备 **cdp-tunnel 3.6.4**。没有识别到扩展时，面板会显示「安装指引」。
+
 已有正常运行的本地 relay 时可以复用。首次安装需要 Node.js 和 npm。在单独的目录中打开 PowerShell，安装项目核对过的 `cdp-tunnel@3.6.4`。
 
 ```powershell
@@ -86,7 +90,7 @@ $env:COCOS_MCP_AUTH_TOKEN = Read-Host 'MCP 控制令牌'
 | 现象 | 检查 |
 | --- | --- |
 | Relay 显示「未响应」 | 确认 relay 仍在运行，并检查 `http://127.0.0.1:9221/json/browsers` 是否返回浏览器列表 |
-| Chrome 扩展显示「等待联通」 | 确认 CDP Bridge 已在目标 Chrome 用户配置中启用，并核对 WebSocket 地址 |
+| Chrome 扩展显示「等待联通」 | 确认 CDP Bridge 已启用，刷新目标页签后点「检查 Bridge」。对于 cdp-tunnel，请核对 WebSocket 地址 |
 | 接管端点显示「不可用」 | 核对面板的 CDP 端口，默认 `9220`。检查该端口的 `/json/version` 是否返回 cdp-tunnel 信息 |
 | 扫描不到目标或匹配有歧义 | 确认目标是已打开的 HTTP/HTTPS 页签。匹配到多个页签时从列表明确选择。若 relay 连接了多个浏览器，保留目标浏览器的连接后重新扫描 |
 | MCP 返回 `401` | 核对 Bearer 令牌是否来自当前运行的扩展实例 |

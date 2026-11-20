@@ -16,11 +16,12 @@ const tabs = [
 test('the installed 2.4 bridge can list and select tabs via a read-only loopback channel', async (t) => {
   const relay = new LegacyRelay(0);
   let tunnelReady = false;
+  let discoveryAvailable = true;
   const adapter = new InstalledBridgeAdapter({
-    async health() { return { extensionConnected: tunnelReady, relayAvailable: true, discoveryAvailable: true }; },
+    async health() { return { extensionConnected: tunnelReady, relayAvailable: true, discoveryAvailable }; },
     async list() {
-      if (tunnelReady) return [{ id: 'primary', url: 'http://localhost:7458/', title: 'Standard channel' }];
-      throw new BrowserError('PROVIDER_UNAVAILABLE', 'No 3.6 client');
+      if (tunnelReady) return [{ id: '1', url: tabs[0].url, title: 'Different tab with the same URL' }];
+      throw new BrowserError('TRANSPORT_ERROR', 'Default port occupied by a different server');
     },
     async dispose() {},
   }, { legacy: relay, inspect: async () => ({ known: true, legacyVersion: '2.4.0' }) });
@@ -47,16 +48,22 @@ test('the installed 2.4 bridge can list and select tabs via a read-only loopback
   }
   assert.equal((await service.bridgeStatus(9220)).extensionConnected, true);
   const listed = await service.run({ action: 'list', port: 9220 });
-  assert.deepEqual(listed.map(({ id }) => id), ['1', '2']);
-  assert.equal((await service.run({ action: 'connect', port: 9220, targetId: '1' })).transport, 'chrome-tab-metadata');
+  const [first, second] = listed;
+  assert.deepEqual(listed.map(({ url }) => url), [tabs[0].url, tabs[1].url]);
+  assert.equal((await service.run({ action: 'connect', port: 9220, targetId: first.id })).transport, 'chrome-tab-metadata');
   assert.equal((await service.pageStatus()).target.url, tabs[0].url);
-  assert.equal((await service.run({ action: 'connect', port: 9220, targetId: '2' })).target.url, tabs[1].url);
+  assert.equal((await service.run({ action: 'connect', port: 9220, targetId: second.id })).target.url, tabs[1].url);
   assert.equal((await service.run({ action: 'disconnect' })).connected, false);
   assert.ok(commands.length > 0);
   assert.deepEqual(commands, commands.map(() => ({ cmd: 'tabs' })));
-  assert.deepEqual((await service.run({ action: 'list', port: 9220 })).map(({ id }) => id), ['1', '2']);
+  assert.deepEqual((await service.run({ action: 'list', port: 9220 })).map(({ id }) => id), [first.id, second.id]);
 
   tunnelReady = true;
-  assert.equal((await service.run({ action: 'list', port: 9220 }))[0].id, 'primary');
-  assert.deepEqual((await service.run({ action: 'list', port: 18765 })).map(({ id }) => id), ['1', '2']);
+  assert.equal((await service.run({ action: 'list', port: 9220 }))[0].id, '1');
+  await assert.rejects(service.run({ action: 'connect', port: 9220, targetId: first.id,
+    url: first.url, title: first.title }), { code: 'NOT_FOUND' });
+  assert.deepEqual((await service.run({ action: 'list', port: 18765 })).map(({ id }) => id), [first.id, second.id]);
+  discoveryAvailable = false;
+  assert.equal((await service.bridgeStatus(9220)).mode, 'metadata');
+  assert.equal((await service.run({ action: 'list', port: 9220 }))[0].id, first.id);
 });

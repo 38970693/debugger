@@ -110,7 +110,7 @@ class LegacyBrowser extends EventEmitter {
     });
     return values.filter((tab) => Number.isSafeInteger(tab?.id) && tab.id >= 0 &&
       isWebUrl(tab.url) && tab.url.length <= 8192).map((tab) => ({
-      id: String(tab.id), url: tab.url, title: typeof tab.title === 'string' ? tab.title.slice(0, 1000) : '',
+      id: `${this.key}:${tab.id}`, url: tab.url, title: typeof tab.title === 'string' ? tab.title.slice(0, 1000) : '',
       ...(typeof tab.active === 'boolean' ? { active: tab.active } : {}),
       [browserKey]: this.key,
     }));
@@ -223,15 +223,24 @@ class InstalledBridgeAdapter {
     return this.installation;
   }
 
+  async route(port, signal) {
+    const [installation, primary] = await Promise.all([
+      this.setup(),
+      this.tunnel.health(port === LEGACY_PORT ? DEFAULT_PORT : port, signal),
+    ]);
+    signal?.throwIfAborted();
+    const tunnelUsable = primary.extensionConnected && primary.discoveryAvailable;
+    const useMetadata = port === LEGACY_PORT ||
+      (port === DEFAULT_PORT && !tunnelUsable && Boolean(installation.legacyVersion));
+    return { installation, primary, useMetadata };
+  }
+
   async health(port, signal) {
-    const installation = await this.setup();
-    const primary = await this.tunnel.health(port === LEGACY_PORT ? DEFAULT_PORT : port, signal);
+    const { installation, primary, useMetadata } = await this.route(port, signal);
     const ready = this.legacy.readyBrowsers().length;
-    const legacySelected = port === LEGACY_PORT ||
-      (port === DEFAULT_PORT && !primary.extensionConnected && installation.legacyVersion);
     const installed = primary.extensionConnected || installation.legacyVersion || installation.tunnelVersion
       ? 'installed' : installation.known ? 'missing' : 'unknown';
-    if (legacySelected) return {
+    if (useMetadata) return {
       installed, relayAvailable: this.legacy.state === 'online', extensionConnected: ready > 0,
       discoveryAvailable: ready === 1, port: LEGACY_PORT, version: installation.legacyVersion,
       mode: 'metadata', ...(ready > 1 ? { issue: '多个 Chrome 配置已连接，请仅保留待使用的 Bridge' } :
@@ -245,13 +254,10 @@ class InstalledBridgeAdapter {
       await this.setup();
       return this.legacy.source().tabs(signal);
     }
-    try {
-      return await this.tunnel.list(port, signal);
-    } catch (error) {
-      signal?.throwIfAborted();
-      if (port !== DEFAULT_PORT || error.code !== 'PROVIDER_UNAVAILABLE' || !(await this.setup()).legacyVersion) throw error;
+    if (port === DEFAULT_PORT && (await this.route(port, signal)).useMetadata) {
       return this.legacy.source().tabs(signal);
     }
+    return this.tunnel.list(port, signal);
   }
 
   async attach(port, id, signal, key) {
